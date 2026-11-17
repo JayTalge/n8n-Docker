@@ -1,0 +1,7 @@
+# Updates for the SHA-pinned GitHub Actions come in as pull requests and are merged by hand.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly

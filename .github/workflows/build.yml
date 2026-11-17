@@ -1,0 +1,122 @@
+name: Build image from upstream release
+
+on:
+  schedule:
+    - cron: "17 2 * * *"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Upstream version to build (empty = newest patch of the last 3 minor lines)"
+        required: false
+      force:
+        description: "Rebuild even if the image is up to date"
+        type: boolean
+        default: false
+  push:
+    branches: [main]
+    paths: ["Dockerfile", "node-overlay.sh", "resolve-versions.py", "smoke.sh", ".github/workflows/build.yml"]
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  UPSTREAM_IMAGE: docker.io/n8nio/n8n
+  IMAGE: ghcr.io/jaytalge/n8n
+  NODE_MAJOR: "26"
+  NODE_FLAVOR: alpine
+
+jobs:
+  resolve:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.r.outputs.matrix }}
+      node: ${{ steps.r.outputs.node }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve versions to build
+        id: r
+        env:
+          ONLY: ${{ inputs.version }}
+          FORCE: ${{ inputs.force || github.event_name == 'push' }}
+          CREDS: ${{ github.actor }}:${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          inspect() { skopeo inspect --override-os linux --override-arch amd64 "$@"; }
+
+          # n8n's :latest is its stable channel (betas go to :next and are skipped)
+          LATEST=$(inspect "docker://$UPSTREAM_IMAGE:latest" | jq -r '.Labels["org.opencontainers.image.version"]')
+          NODE=$(inspect "docker://docker.io/library/node:$NODE_MAJOR-$NODE_FLAVOR" | jq -r '.Env[] | select(startswith("NODE_VERSION=")) | sub("NODE_VERSION="; "")')
+          echo "upstream latest $LATEST, node $NODE"
+
+          export LATEST ONLY
+          skopeo list-tags "docker://$UPSTREAM_IMAGE" | jq -r '.Tags[]' | python3 resolve-versions.py > candidates.json
+
+          todo='[]'
+          for row in $(jq -c '.[]' candidates.json); do
+            v=$(jq -r .version <<<"$row")
+            want="$v/node-$NODE"
+            have=$(inspect --creds "$CREDS" "docker://$IMAGE:$v" 2>/dev/null | jq -r '.Labels["de.jason-talge.build-key"] // empty' || true)
+            if [ "$FORCE" = "true" ] || [ "$have" != "$want" ]; then
+              echo "build $v (have '${have:-none}', want '$want')"
+              todo=$(jq -c --argjson r "$row" '. + [$r]' <<<"$todo")
+            else
+              echo "skip $v (up to date)"
+            fi
+          done
+          echo "matrix=$todo" >> "$GITHUB_OUTPUT"
+          echo "node=$NODE" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: resolve
+    if: needs.resolve.outputs.matrix != '[]'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.resolve.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build for test
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          load: true
+          pull: true
+          build-args: |
+            N8N_VERSION=${{ matrix.version }}
+            NODE_VERSION=${{ needs.resolve.outputs.node }}
+          tags: n8n:smoke
+
+      - name: Smoke test
+        run: ./smoke.sh n8n:smoke "${{ matrix.version }}" "${{ needs.resolve.outputs.node }}"
+
+      - name: Push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          push: true
+          provenance: false
+          build-args: |
+            N8N_VERSION=${{ matrix.version }}
+            NODE_VERSION=${{ needs.resolve.outputs.node }}
+          tags: |
+            ${{ env.IMAGE }}:${{ matrix.version }}
+            ${{ env.IMAGE }}:${{ matrix.minor }}
+            ${{ matrix.latest && format('{0}:latest', env.IMAGE) || '' }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.version=${{ matrix.version }}
+            de.jason-talge.build-key=${{ matrix.version }}/node-${{ needs.resolve.outputs.node }}
